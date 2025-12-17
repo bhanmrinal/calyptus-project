@@ -1,13 +1,28 @@
+import argparse
 import csv
 import hashlib
-import os
-from datetime import datetime
+import logging
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - very small fallback
+
+    def tqdm(iterable: Iterable, **_: Dict) -> Iterable:
+        return iterable
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 DATA_DIR = Path("data")
@@ -49,20 +64,6 @@ EUROPE_REMOTE_HINTS = [
     "estonia",
     "lithuania",
     "latvia",
-]
-
-LEVER_COMPANIES = [
-    "openai",
-    "huggingface",
-    "deepmind",
-    "stabilityai",
-]
-
-ASHBY_COMPANIES = [
-    "perplexity",
-    "mistral",
-    "anthropic",
-    "cohere",
 ]
 
 REQUEST_HEADERS = {
@@ -113,9 +114,11 @@ def fetch_url(url: str) -> Optional[str]:
     try:
         response = requests.get(url, headers=REQUEST_HEADERS, timeout=15)
         if response.status_code != 200:
+            logger.warning("Non-200 status %s for URL %s", response.status_code, url)
             return None
         return response.text
     except requests.RequestException:
+        logger.exception("Request failed for URL %s", url)
         return None
 
 
@@ -144,6 +147,7 @@ def scrape_lever_company(company: str) -> List[Dict[str, str]]:
     base_url = f"https://jobs.lever.co/{company}"
     html = fetch_url(base_url)
     if not html:
+        logger.warning("No HTML returned for Lever company %s", company)
         return []
 
     soup = BeautifulSoup(html, "html.parser")
@@ -208,10 +212,28 @@ def fetch_lever_job_description(job_url: str) -> str:
 
 
 def scrape_lever() -> List[Dict[str, str]]:
-    """Scrape Lever for all configured companies."""
+    """Backward-compatible wrapper that scrapes Lever using default companies."""
+    default_companies = [
+        "openai",
+        "huggingface",
+        "deepmind",
+        "stabilityai",
+    ]
+    return scrape_lever_for_companies(default_companies)
+
+
+def scrape_lever_for_companies(companies: List[str]) -> List[Dict[str, str]]:
+    """Scrape Lever for the given companies, logging per-company counts."""
     all_jobs: List[Dict[str, str]] = []
-    for company in LEVER_COMPANIES:
-        all_jobs.extend(scrape_lever_company(company))
+    for company in tqdm(companies, desc="Lever companies"):
+        try:
+            company_jobs = scrape_lever_company(company)
+        except Exception:
+            logger.exception("Failed to scrape Lever for company %s", company)
+            continue
+
+        logger.info("[lever] %s: scraped %d matching jobs", company, len(company_jobs))
+        all_jobs.extend(company_jobs)
     return all_jobs
 
 
@@ -223,6 +245,7 @@ def scrape_ashby_company(company: str) -> List[Dict[str, str]]:
     base_url = f"https://jobs.ashbyhq.com/{company}"
     html = fetch_url(base_url)
     if not html:
+        logger.warning("No HTML returned for Ashby company %s", company)
         return []
 
     soup = BeautifulSoup(html, "html.parser")
@@ -294,16 +317,34 @@ def fetch_ashby_job_description(job_url: str) -> str:
 
 
 def scrape_ashby() -> List[Dict[str, str]]:
-    """Scrape Ashby for all configured companies."""
+    """Backward-compatible wrapper that scrapes Ashby using default companies."""
+    default_companies = [
+        "perplexity",
+        "mistral",
+        "anthropic",
+        "cohere",
+    ]
+    return scrape_ashby_for_companies(default_companies)
+
+
+def scrape_ashby_for_companies(companies: List[str]) -> List[Dict[str, str]]:
+    """Scrape Ashby for the given companies, logging per-company counts."""
     all_jobs: List[Dict[str, str]] = []
-    for company in ASHBY_COMPANIES:
-        all_jobs.extend(scrape_ashby_company(company))
+    for company in tqdm(companies, desc="Ashby companies"):
+        try:
+            company_jobs = scrape_ashby_company(company)
+        except Exception:
+            logger.exception("Failed to scrape Ashby for company %s", company)
+            continue
+
+        logger.info("[ashby] %s: scraped %d matching jobs", company, len(company_jobs))
+        all_jobs.extend(company_jobs)
     return all_jobs
 
 
 def normalize_jobs(raw_jobs: List[Dict[str, str]]) -> pd.DataFrame:
     """Normalize raw job dicts into a DataFrame with required schema."""
-    now_iso = datetime.utcnow().isoformat() + "Z"
+    now_iso = datetime.now(UTC).isoformat()
 
     normalized: List[Dict[str, str]] = []
     for job in raw_jobs:
@@ -355,10 +396,96 @@ def compute_delta(master_df: pd.DataFrame, current_df: pd.DataFrame) -> pd.DataF
 
 def main() -> None:
     """Main entry point for CLI execution."""
+    parser = argparse.ArgumentParser(
+        description="Weekly ATS Job Scraper for Lever and Ashby."
+    )
+    parser.add_argument(
+        "query",
+        type=str,
+        help=(
+            "Free-form search query description "
+            '(e.g. "AI engineer roles in Europe / remote from Lever and Ashby"). '
+            "Used for logging and to document the intent of this run."
+        ),
+    )
+    parser.add_argument(
+        "--lever-companies",
+        type=str,
+        default="",
+        help="Comma-separated Lever company slugs (no default; required unless using --lever-companies-file)",
+    )
+    parser.add_argument(
+        "--lever-companies-file",
+        type=str,
+        default="",
+        help="Optional path to a text file with one Lever company slug per line",
+    )
+    parser.add_argument(
+        "--ashby-companies",
+        type=str,
+        default="",
+        help="Comma-separated Ashby company slugs (no default; required unless using --ashby-companies-file)",
+    )
+    parser.add_argument(
+        "--ashby-companies-file",
+        type=str,
+        default="",
+        help="Optional path to a text file with one Ashby company slug per line",
+    )
+    args = parser.parse_args()
+
+    lever_companies: List[str] = []
+    if args.lever_companies:
+        lever_companies.extend(
+            [c.strip() for c in args.lever_companies.split(",") if c.strip()]
+        )
+    if args.lever_companies_file:
+        lever_file_path = Path(args.lever_companies_file)
+        if not lever_file_path.exists():
+            logger.error("Lever companies file not found: %s", lever_file_path)
+        else:
+            with lever_file_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    slug = line.strip()
+                    if slug:
+                        lever_companies.append(slug)
+
+    ashby_companies: List[str] = []
+    if args.ashby_companies:
+        ashby_companies.extend(
+            [c.strip() for c in args.ashby_companies.split(",") if c.strip()]
+        )
+    if args.ashby_companies_file:
+        ashby_file_path = Path(args.ashby_companies_file)
+        if not ashby_file_path.exists():
+            logger.error("Ashby companies file not found: %s", ashby_file_path)
+        else:
+            with ashby_file_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    slug = line.strip()
+                    if slug:
+                        ashby_companies.append(slug)
+
+    # Remove duplicates while preserving order
+    lever_companies = list(dict.fromkeys(lever_companies))
+    ashby_companies = list(dict.fromkeys(ashby_companies))
+
+    if not lever_companies and not ashby_companies:
+        logger.error(
+            "No companies specified. Provide Lever and/or Ashby companies via "
+            "--lever-companies / --ashby-companies or their *_file variants."
+        )
+        return
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    lever_jobs = scrape_lever()
-    ashby_jobs = scrape_ashby()
+    logger.info("Starting ATS job scrape...")
+    logger.info("Search query (for documentation/intention): %s", args.query)
+    logger.info("Lever companies: %s", ", ".join(lever_companies))
+    logger.info("Ashby companies: %s", ", ".join(ashby_companies))
+
+    lever_jobs = scrape_lever_for_companies(lever_companies)
+    ashby_jobs = scrape_ashby_for_companies(ashby_companies)
 
     all_raw_jobs = lever_jobs + ashby_jobs
     all_jobs_df = normalize_jobs(all_raw_jobs)
@@ -372,12 +499,16 @@ def main() -> None:
     else:
         updated_master = master_df
 
-    save_csv(updated_master, MASTER_CSV_PATH)
-    save_csv(delta_df, DELTA_CSV_PATH)
-
     total_scraped = len(all_jobs_df)
     new_jobs_count = len(delta_df)
 
+    logger.info("Total jobs scraped this run (after filters): %d", total_scraped)
+    logger.info("New jobs found vs master: %d", new_jobs_count)
+
+    save_csv(updated_master, MASTER_CSV_PATH)
+    save_csv(delta_df, DELTA_CSV_PATH)
+
+    print("CSV files updated successfully.")
     print(f"Total jobs scraped this run: {total_scraped}")
     print(f"New jobs found: {new_jobs_count}")
     print(f"Master CSV path: {MASTER_CSV_PATH}")

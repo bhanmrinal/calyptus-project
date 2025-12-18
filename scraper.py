@@ -16,14 +16,13 @@ from bs4 import BeautifulSoup
 try:
     from dotenv import load_dotenv
 
-    load_dotenv()  # Load environment variables from .env file
+    load_dotenv()
 except ImportError:
-    # python-dotenv not installed, skip loading .env
     pass
 
 try:
     from tqdm.auto import tqdm
-except Exception:  # pragma: no cover - very small fallback
+except Exception:
 
     def tqdm(iterable: Iterable, **_: Dict) -> Iterable:
         return iterable
@@ -36,6 +35,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Configuration
 DATA_DIR = Path("data")
 MASTER_CSV_PATH = DATA_DIR / "master_jobs.csv"
 DELTA_CSV_PATH = DATA_DIR / "delta_jobs.csv"
@@ -77,19 +77,20 @@ EUROPE_REMOTE_HINTS = [
     "latvia",
 ]
 
-# Allowed ATS domains for job discovery
-ATS_DOMAINS = [
-    "jobs.lever.co",
-    "jobs.ashbyhq.com",
-    "boards.greenhouse.io",
-    "jobs.smartrecruiters.com",
-    "wd1.myworkdayjobs.com",
-    "jobs.bamboohr.com",
-    "jobs.jobvite.com",
-    "careers.icims.com",
-    "apply.jazz.co",
-    "careers.workable.com",
+ATS_PLATFORMS = [
+    ("jobs.lever.co", "lever"),
+    ("jobs.ashbyhq.com", "ashby"),
+    ("boards.greenhouse.io", "greenhouse"),
+    ("jobs.smartrecruiters.com", "smartrecruiters"),
+    ("wd1.myworkdayjobs.com", "workday"),
+    ("jobs.bamboohr.com", "bamboohr"),
+    ("jobs.jobvite.com", "jobvite"),
+    ("careers.icims.com", "icims"),
+    ("apply.jazz.co", "jazz"),
+    ("careers.workable.com", "workable"),
 ]
+
+ATS_DOMAINS = [domain for domain, _ in ATS_PLATFORMS]
 
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; ATSJobScraper/1.0; +https://example.com)",
@@ -97,34 +98,11 @@ REQUEST_HEADERS = {
 }
 
 
-def load_env_from_file(path: Path = Path(".env")) -> None:
-    """
-    Very small .env loader so we don't depend on external libraries.
-    Loads KEY=VALUE lines into os.environ if not already set.
-    """
-    try:
-        if not path.exists():
-            return
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip()
-            if key and key not in os.environ:
-                os.environ[key] = value
-    except Exception:
-        # Safe to ignore .env failures; environment variables still work.
-        logger.debug("Failed to load environment variables from %s", path)
-
-
-# Load environment variables from .env if present
-load_env_from_file()
+# Persistence Layer
 
 
 def generate_job_id(title: str, company: str, location: str, url: str) -> str:
-    """Generate a deterministic job ID based on title, company, location, and URL."""
+    """Generate deterministic job ID from job attributes."""
     base = "||".join(
         [
             (title or "").strip().lower(),
@@ -137,7 +115,7 @@ def generate_job_id(title: str, company: str, location: str, url: str) -> str:
 
 
 def load_master_csv(path: Path = MASTER_CSV_PATH) -> pd.DataFrame:
-    """Load the master CSV if it exists, otherwise return an empty DataFrame."""
+    """Load master CSV if exists, otherwise return empty DataFrame."""
     if not path.exists():
         return pd.DataFrame(
             columns=[
@@ -155,13 +133,26 @@ def load_master_csv(path: Path = MASTER_CSV_PATH) -> pd.DataFrame:
 
 
 def save_csv(df: pd.DataFrame, path: Path) -> None:
-    """Save a DataFrame to CSV, ensuring the parent directory exists."""
+    """Save DataFrame to CSV with proper quoting."""
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False, quoting=csv.QUOTE_ALL)
 
 
+def compute_delta(master_df: pd.DataFrame, current_df: pd.DataFrame) -> pd.DataFrame:
+    """Return jobs from current_df that are not in master_df."""
+    if master_df.empty:
+        return current_df.copy()
+
+    master_ids = set(master_df["job_id"].astype(str))
+    mask = ~current_df["job_id"].astype(str).isin(master_ids)
+    return current_df[mask].copy()
+
+
+# HTTP Layer
+
+
 def fetch_url(url: str) -> Optional[str]:
-    """Fetch URL content with basic error handling."""
+    """Fetch URL content with error handling."""
     try:
         response = requests.get(url, headers=REQUEST_HEADERS, timeout=15)
         if response.status_code != 200:
@@ -173,61 +164,132 @@ def fetch_url(url: str) -> Optional[str]:
         return None
 
 
-def passes_keyword_filter(title: str, description: str) -> bool:
-    """Return True if the job matches any of the keyword filters."""
-    combined = f"{title} {description}".lower()
-    return any(keyword in combined for keyword in KEYWORDS)
+# ============================================================================
+# Discovery Layer (Search API)
+# ============================================================================
 
 
-def passes_location_filter(location: str, description: str) -> bool:
+def _extract_urls_from_serpapi_response(
+    data: dict, platform_domain: str
+) -> List[tuple]:
+    """Extract (url, title) tuples from SerpAPI JSON response."""
+    urls = []
+    if "organic_results" in data:
+        for result in data["organic_results"]:
+            url = result.get("link", "")
+            title = result.get("title", "")
+            if url and platform_domain in url:
+                urls.append((url, title))
+    return urls
+
+
+def _extract_urls_from_bing_response(data: dict, platform_domain: str) -> List[tuple]:
+    """Extract (url, title) tuples from Bing API JSON response."""
+    urls = []
+    if "webPages" in data and "value" in data["webPages"]:
+        for result in data["webPages"]["value"]:
+            url = result.get("url", "")
+            title = result.get("name", "")
+            if url and platform_domain in url:
+                urls.append((url, title))
+    return urls
+
+
+def _query_search_api(
+    search_query: str,
+    platform_domain: str,
+    serpapi_key: Optional[str],
+    bing_api_key: Optional[str],
+) -> tuple[List[tuple], Optional[str]]:
     """
-    Simple Europe / Remote heuristic.
-
-    - If location is empty, fall back to description text.
-    - Keep jobs mentioning 'remote', 'europe', or common European country names.
+    Query search API (SerpAPI or Bing) and return (url, title) pairs.
+    Returns (urls_found, api_used).
     """
-    text = f"{location} {description}".lower()
-    return any(hint in text for hint in EUROPE_REMOTE_HINTS)
+    urls_found = []
+    api_used = None
+
+    # Try SerpAPI first
+    if serpapi_key:
+        try:
+            response = requests.get(
+                "https://serpapi.com/search",
+                params={
+                    "q": search_query,
+                    "api_key": serpapi_key,
+                    "num": 50,
+                    "engine": "google",
+                },
+                timeout=20,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                api_used = "SerpAPI"
+                urls_found = _extract_urls_from_serpapi_response(data, platform_domain)
+                logger.info(
+                    "SerpAPI returned %d results for %s",
+                    len(data.get("organic_results", [])),
+                    platform_domain,
+                )
+            elif response.status_code == 401:
+                logger.warning("SerpAPI key invalid or expired")
+            elif response.status_code == 429:
+                logger.warning("SerpAPI quota exceeded")
+            else:
+                logger.debug(
+                    "SerpAPI returned status %d for %s",
+                    response.status_code,
+                    platform_domain,
+                )
+        except requests.RequestException as e:
+            logger.debug("SerpAPI request failed for %s: %s", platform_domain, e)
+        except Exception as e:
+            logger.debug("SerpAPI parsing failed for %s: %s", platform_domain, e)
+
+    # Fallback to Bing API if SerpAPI failed or not configured
+    if not urls_found and bing_api_key:
+        try:
+            response = requests.get(
+                "https://api.bing.microsoft.com/v7.0/search",
+                headers={"Ocp-Apim-Subscription-Key": bing_api_key},
+                params={"q": search_query, "count": 50},
+                timeout=20,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                api_used = "Bing API"
+                urls_found = _extract_urls_from_bing_response(data, platform_domain)
+                logger.info(
+                    "Bing API returned %d results for %s",
+                    len(data.get("webPages", {}).get("value", [])),
+                    platform_domain,
+                )
+            elif response.status_code == 401:
+                logger.warning("Bing API key invalid")
+            elif response.status_code == 429:
+                logger.warning("Bing API quota exceeded")
+            else:
+                logger.debug(
+                    "Bing API returned status %d for %s",
+                    response.status_code,
+                    platform_domain,
+                )
+        except requests.RequestException as e:
+            logger.debug("Bing API request failed for %s: %s", platform_domain, e)
+        except Exception as e:
+            logger.debug("Bing API parsing failed for %s: %s", platform_domain, e)
+
+    return urls_found, api_used
 
 
-def search_jobs_via_api(
+def discover_job_urls_via_search_api(
     query_keywords: List[str], location_keywords: List[str], max_results: int = 100
 ) -> List[Dict[str, str]]:
     """
-    Search for jobs using search API (SerpAPI or Bing Web Search API).
-    Returns a list of job dicts with url, title, company, location, description, source.
-
-    Discovery is performed via search-engine APIs indexing ATS domains,
-    rather than static company lists, to ensure coverage of newly hiring companies.
+    Discover job URLs via search API (SerpAPI or Bing).
+    Returns list of job dicts with url, title, company, source (location/description empty).
     """
     logger.info("Searching for jobs via search API...")
 
-    # Map ATS domains to source names
-    ats_platforms = [
-        ("jobs.lever.co", "lever"),
-        ("jobs.ashbyhq.com", "ashby"),
-        ("boards.greenhouse.io", "greenhouse"),
-        ("jobs.smartrecruiters.com", "smartrecruiters"),
-        ("wd1.myworkdayjobs.com", "workday"),
-        ("jobs.bamboohr.com", "bamboohr"),
-        ("jobs.jobvite.com", "jobvite"),
-        ("careers.icims.com", "icims"),
-        ("apply.jazz.co", "jazz"),
-        ("careers.workable.com", "workable"),
-    ]
-
-    all_jobs: List[Dict[str, str]] = []
-    seen_urls = set()
-
-    # Build simple queries respecting Google's 32-word limit
-    # Use small keyword/location sets to keep queries manageable
-    limited_keywords = query_keywords[:3]  # Limit to 3 keywords
-    limited_locations = location_keywords[:4]  # Limit to 4 locations
-
-    keyword_part = " OR ".join([f'"{kw}"' for kw in limited_keywords])
-    location_part = " OR ".join([f'"{loc}"' for loc in limited_locations])
-
-    # Get API keys once at the start
     serpapi_key = os.getenv("SERPAPI_KEY")
     bing_api_key = os.getenv("BING_SEARCH_API_KEY")
 
@@ -237,115 +299,30 @@ def search_jobs_via_api(
         )
         return []
 
-    for platform_domain, source_name in ats_platforms:
+    # Build search query parts (limit to respect API constraints)
+    limited_keywords = query_keywords[:3]
+    limited_locations = location_keywords[:4]
+    keyword_part = " OR ".join([f'"{kw}"' for kw in limited_keywords])
+    location_part = " OR ".join([f'"{loc}"' for loc in limited_locations])
+
+    discovered_jobs = []
+    seen_urls = set()
+
+    for platform_domain, source_name in ATS_PLATFORMS:
         try:
-            # Build search query: site:platform (keywords) AND (locations)
-            # Keep simple to respect 32-word limit
             search_query = (
                 f"site:{platform_domain} ({keyword_part}) AND ({location_part})"
             )
-
             logger.info("Searching %s with query: %s", platform_domain, search_query)
 
-            # Try SerpAPI first, fallback to Bing Web Search API
-            urls_found = []
-            api_used = None
+            urls_found, api_used = _query_search_api(
+                search_query, platform_domain, serpapi_key, bing_api_key
+            )
 
-            # Try SerpAPI (recommended)
-            if serpapi_key:
-                try:
-                    serpapi_url = "https://serpapi.com/search"
-                    params = {
-                        "q": search_query,
-                        "api_key": serpapi_key,
-                        "num": 50,
-                        "engine": "google",
-                    }
-                    response = requests.get(serpapi_url, params=params, timeout=20)
-                    if response.status_code == 200:
-                        data = response.json()
-                        api_used = "SerpAPI"
-                        # Extract URLs from SerpAPI JSON response
-                        if "organic_results" in data:
-                            for result in data["organic_results"]:
-                                url = result.get("link", "")
-                                title = result.get("title", "")
-                                if url and platform_domain in url:
-                                    urls_found.append((url, title))
-                        logger.info(
-                            "SerpAPI returned %d results for %s",
-                            len(data.get("organic_results", [])),
-                            platform_domain,
-                        )
-                    elif response.status_code == 401:
-                        logger.warning("SerpAPI key invalid or expired")
-                    elif response.status_code == 429:
-                        logger.warning("SerpAPI quota exceeded")
-                    else:
-                        logger.debug(
-                            "SerpAPI returned status %d for %s",
-                            response.status_code,
-                            platform_domain,
-                        )
-                except requests.RequestException as e:
-                    logger.debug(
-                        "SerpAPI request failed for %s: %s", platform_domain, e
-                    )
-                except Exception as e:
-                    logger.debug(
-                        "SerpAPI parsing failed for %s: %s", platform_domain, e
-                    )
-
-            # Fallback to Bing Web Search API if SerpAPI failed or not configured
-            if not urls_found and bing_api_key:
-                try:
-                    bing_url = "https://api.bing.microsoft.com/v7.0/search"
-                    headers = {"Ocp-Apim-Subscription-Key": bing_api_key}
-                    params = {"q": search_query, "count": 50}
-                    response = requests.get(
-                        bing_url, headers=headers, params=params, timeout=20
-                    )
-                    if response.status_code == 200:
-                        data = response.json()
-                        api_used = "Bing API"
-                        # Extract URLs from Bing API JSON response
-                        if "webPages" in data and "value" in data["webPages"]:
-                            for result in data["webPages"]["value"]:
-                                url = result.get("url", "")
-                                title = result.get("name", "")
-                                if url and platform_domain in url:
-                                    urls_found.append((url, title))
-                        logger.info(
-                            "Bing API returned %d results for %s",
-                            len(data.get("webPages", {}).get("value", [])),
-                            platform_domain,
-                        )
-                    elif response.status_code == 401:
-                        logger.warning("Bing API key invalid")
-                    elif response.status_code == 429:
-                        logger.warning("Bing API quota exceeded")
-                    else:
-                        logger.debug(
-                            "Bing API returned status %d for %s",
-                            response.status_code,
-                            platform_domain,
-                        )
-                except requests.RequestException as e:
-                    logger.debug(
-                        "Bing API request failed for %s: %s", platform_domain, e
-                    )
-                except Exception as e:
-                    logger.debug(
-                        "Bing API parsing failed for %s: %s", platform_domain, e
-                    )
-
-            # Process found URLs
             found_count = 0
             for url, title in urls_found:
                 if url in seen_urls:
                     continue
-
-                # Filter out search pages, not actual job postings
                 if "/search" in url.lower() or "?q=" in url:
                     continue
 
@@ -362,16 +339,16 @@ def search_jobs_via_api(
                     if match:
                         company = match.group(1)
 
-                # Create initial job dict (will be enriched by scraping)
-                job = {
-                    "url": url,
-                    "title": title or "Job Posting",
-                    "company": company,
-                    "location": "",
-                    "description": "",
-                    "source": source_name,
-                }
-                all_jobs.append(job)
+                discovered_jobs.append(
+                    {
+                        "url": url,
+                        "title": title or "Job Posting",
+                        "company": company,
+                        "location": "",
+                        "description": "",
+                        "source": source_name,
+                    }
+                )
                 found_count += 1
 
             if found_count > 0:
@@ -381,328 +358,170 @@ def search_jobs_via_api(
                     platform_domain,
                     api_used or "Unknown",
                 )
-            else:
-                logger.debug("No job URLs found for %s", platform_domain)
 
-            # Rate limiting
-            time.sleep(1)
+            time.sleep(1)  # Rate limiting
 
         except Exception:
             logger.exception("Error searching %s", platform_domain)
             continue
 
-    logger.info("Found %d total job URLs via search API", len(all_jobs))
-    if len(all_jobs) == 0:
+    logger.info("Found %d total job URLs via search API", len(discovered_jobs))
+    if len(discovered_jobs) == 0:
         logger.warning(
-            "Zero jobs found. Check API keys and quotas. Set SERPAPI_KEY or BING_SEARCH_API_KEY environment variable."
-        )
-    return all_jobs[:max_results]
-
-
-def scrape_lever_company(company: str) -> List[Dict[str, str]]:
-    """
-    Scrape jobs from a single Lever company page.
-    Returns a list of normalized job dicts without job_id/scraped_at.
-    """
-    base_url = f"https://jobs.lever.co/{company}"
-    html = fetch_url(base_url)
-    if not html:
-        logger.warning("No HTML returned for Lever company %s", company)
-        return []
-
-    soup = BeautifulSoup(html, "html.parser")
-    postings = soup.find_all("div", class_="posting")
-
-    jobs: List[Dict[str, str]] = []
-
-    for posting in postings:
-        link = posting.find("a", href=True)
-        if not link:
-            continue
-
-        title_el = posting.find("h5") or linking_text_element(link=link)
-        title = title_el.get_text(strip=True) if title_el else link.get_text(strip=True)
-        location_el = posting.find("span", class_="sort-by-location")
-        location = location_el.get_text(strip=True) if location_el else ""
-
-        job_url = link["href"]
-        if not job_url.startswith("http"):
-            job_url = f"https://jobs.lever.co{job_url}"
-
-        description = fetch_lever_job_description(job_url)
-
-        if not passes_keyword_filter(title, description):
-            continue
-        if not passes_location_filter(location, description):
-            continue
-
-        jobs.append(
-            {
-                "title": title,
-                "company": company,
-                "location": location or "Unknown",
-                "description": description,
-                "url": job_url,
-                "source": "lever",
-            }
+            "Zero job URLs discovered. Possible causes: API quota exceeded, invalid API key, or no matching jobs."
         )
 
-    return jobs
+    return discovered_jobs[:max_results]
 
 
-def linking_text_element(link) -> Optional[BeautifulSoup]:
-    """
-    Fallback helper to get a title element from a link if structured tags are missing.
-    """
-    return link
+# ============================================================================
+# Enrichment Layer (Web Scraping)
+# ============================================================================
 
 
-def fetch_lever_job_description(job_url: str) -> str:
-    """Fetch basic job description text from Lever job detail page."""
-    html = fetch_url(job_url)
-    if not html:
-        return ""
-    soup = BeautifulSoup(html, "html.parser")
-    description_container = soup.find("div", class_="section-wrapper")
-    if not description_container:
-        description_container = soup.find("div", class_="posting")
-    if not description_container:
-        return ""
-    return " ".join(description_container.get_text(separator=" ", strip=True).split())
+def _parse_lever_job_page(soup: BeautifulSoup, url: str) -> Dict[str, str]:
+    """Extract job data from Lever job page."""
+    job_data = {}
 
+    title_el = soup.find("h2", class_="posting-headline") or soup.find("h1")
+    if title_el:
+        job_data["title"] = title_el.get_text(strip=True)
 
-def scrape_lever() -> List[Dict[str, str]]:
-    """Backward-compatible wrapper that scrapes Lever using default companies."""
-    default_companies = [
-        "openai",
-        "huggingface",
-        "deepmind",
-        "stabilityai",
-    ]
-    return scrape_lever_for_companies(default_companies)
+    location_el = soup.find("div", class_="posting-categories") or soup.find(
+        "span", class_="sort-by-location"
+    )
+    if location_el:
+        job_data["location"] = location_el.get_text(strip=True)
 
-
-def scrape_lever_for_companies(companies: List[str]) -> List[Dict[str, str]]:
-    """Scrape Lever for the given companies, logging per-company counts."""
-    all_jobs: List[Dict[str, str]] = []
-    for company in tqdm(companies, desc="Lever companies"):
-        try:
-            company_jobs = scrape_lever_company(company)
-        except Exception:
-            logger.exception("Failed to scrape Lever for company %s", company)
-            continue
-
-        logger.info("[lever] %s: scraped %d matching jobs", company, len(company_jobs))
-        all_jobs.extend(company_jobs)
-    return all_jobs
-
-
-def scrape_ashby_company(company: str) -> List[Dict[str, str]]:
-    """
-    Scrape jobs from a single Ashby company page.
-    Returns a list of normalized job dicts without job_id/scraped_at.
-    """
-    base_url = f"https://jobs.ashbyhq.com/{company}"
-    html = fetch_url(base_url)
-    if not html:
-        logger.warning("No HTML returned for Ashby company %s", company)
-        return []
-
-    soup = BeautifulSoup(html, "html.parser")
-    jobs: List[Dict[str, str]] = []
-    seen_links = set()
-
-    for link in soup.find_all("a", href=True):
-        href = link["href"]
-        if "/job/" not in href:
-            continue
-        if href.startswith("mailto:") or href.startswith("tel:"):
-            continue
-        if href in seen_links:
-            continue
-        seen_links.add(href)
-
-        job_url = href
-        if not job_url.startswith("http"):
-            if job_url.startswith("/"):
-                job_url = f"https://jobs.ashbyhq.com{job_url}"
-            else:
-                job_url = f"https://jobs.ashbyhq.com/{href}"
-
-        title = link.get_text(strip=True)
-        if not title:
-            continue
-
-        # Default Ashby location assumption for this simple implementation
-        location = "Remote / Europe"
-        description = fetch_ashby_job_description(job_url)
-
-        if not passes_keyword_filter(title, description):
-            continue
-        if not passes_location_filter(location, description):
-            continue
-
-        jobs.append(
-            {
-                "title": title,
-                "company": company,
-                "location": location,
-                "description": description,
-                "url": job_url,
-                "source": "ashby",
-            }
+    desc_el = soup.find("div", class_="section-wrapper") or soup.find(
+        "div", class_="posting"
+    )
+    if desc_el:
+        job_data["description"] = " ".join(
+            desc_el.get_text(separator=" ", strip=True).split()[:500]
         )
 
-    return jobs
+    # Extract company from URL if needed
+    match = re.search(r"jobs\.lever\.co/([^/]+)", url)
+    if match:
+        job_data["company"] = match.group(1)
+
+    return job_data
 
 
-def fetch_ashby_job_description(job_url: str) -> str:
-    """Fetch basic job description text from Ashby job detail page."""
-    html = fetch_url(job_url)
-    if not html:
-        return ""
+def _parse_ashby_job_page(soup: BeautifulSoup, url: str) -> Dict[str, str]:
+    """Extract job data from Ashby job page."""
+    job_data = {}
 
-    soup = BeautifulSoup(html, "html.parser")
+    title_el = soup.find("h1") or soup.find("title")
+    if title_el:
+        job_data["title"] = title_el.get_text(strip=True)
 
-    # Try common Ashby containers; fall back to full page text if needed.
-    description_container = (
+    location_el = soup.find("div", attrs={"data-testid": "job-location"}) or soup.find(
+        "span", class_="location"
+    )
+    if location_el:
+        job_data["location"] = location_el.get_text(strip=True)
+
+    desc_el = (
         soup.find("section", attrs={"data-testid": "job-description"})
         or soup.find("div", attrs={"data-testid": "job-description"})
         or soup.find("main")
     )
-    if not description_container:
-        return ""
+    if desc_el:
+        job_data["description"] = " ".join(
+            desc_el.get_text(separator=" ", strip=True).split()[:500]
+        )
 
-    return " ".join(description_container.get_text(separator=" ", strip=True).split())
+    # Extract company from URL if needed
+    match = re.search(r"jobs\.ashbyhq\.com/([^/]+)", url)
+    if match:
+        job_data["company"] = match.group(1)
 
-
-def scrape_ashby() -> List[Dict[str, str]]:
-    """Backward-compatible wrapper that scrapes Ashby using default companies."""
-    default_companies = [
-        "perplexity",
-        "mistral",
-        "anthropic",
-        "cohere",
-    ]
-    return scrape_ashby_for_companies(default_companies)
+    return job_data
 
 
-def scrape_ashby_for_companies(companies: List[str]) -> List[Dict[str, str]]:
-    """Scrape Ashby for the given companies, logging per-company counts."""
-    all_jobs: List[Dict[str, str]] = []
-    for company in tqdm(companies, desc="Ashby companies"):
-        try:
-            company_jobs = scrape_ashby_company(company)
-        except Exception:
-            logger.exception("Failed to scrape Ashby for company %s", company)
-            continue
+def _parse_generic_job_page(soup: BeautifulSoup) -> Dict[str, str]:
+    """Extract job data from generic ATS job page (fallback parser)."""
+    job_data = {}
 
-        logger.info("[ashby] %s: scraped %d matching jobs", company, len(company_jobs))
-        all_jobs.extend(company_jobs)
-    return all_jobs
+    title_el = soup.find("h1") or soup.find("title")
+    if title_el:
+        job_data["title"] = title_el.get_text(strip=True)
+
+    desc_el = (
+        soup.find("main")
+        or soup.find("article")
+        or soup.find("div", class_="description")
+    )
+    if desc_el:
+        job_data["description"] = " ".join(
+            desc_el.get_text(separator=" ", strip=True).split()[:500]
+        )
+
+    return job_data
 
 
 def enrich_job_from_url(job: Dict[str, str]) -> Dict[str, str]:
     """
-    Enrich a job dict (found via search) by scraping the actual job URL
-    to get full title, location, description, and company details.
+    Enrich job dict by scraping the job URL for full details.
+    Lever and Ashby use platform-specific parsers; other platforms use generic parser.
     """
     url = job.get("url", "")
     if not url or not url.startswith("http"):
         return job
 
-    source = job.get("source", "")
     html = fetch_url(url)
     if not html:
         return job
 
     soup = BeautifulSoup(html, "html.parser")
+    source = job.get("source", "")
 
-    # Lever-specific parsing
+    # Platform-specific parsing
     if source == "lever":
-        # Try to get better title
-        title_el = soup.find("h2", class_="posting-headline") or soup.find("h1")
-        if title_el:
-            job["title"] = title_el.get_text(strip=True)
-
-        # Try to get location
-        location_el = soup.find("div", class_="posting-categories") or soup.find(
-            "span", class_="sort-by-location"
-        )
-        if location_el:
-            job["location"] = location_el.get_text(strip=True)
-
-        # Get description
-        desc_el = soup.find("div", class_="section-wrapper") or soup.find(
-            "div", class_="posting"
-        )
-        if desc_el:
-            job["description"] = " ".join(
-                desc_el.get_text(separator=" ", strip=True).split()[:500]
-            )  # Limit length
-
-        # Extract company from URL if not set
-        if job.get("company") == "Unknown":
-            match = re.search(r"jobs\.lever\.co/([^/]+)", url)
-            if match:
-                job["company"] = match.group(1)
-
-    # Ashby-specific parsing
+        enriched = _parse_lever_job_page(soup, url)
     elif source == "ashby":
-        # Try to get better title
-        title_el = soup.find("h1") or soup.find("title")
-        if title_el:
-            job["title"] = title_el.get_text(strip=True)
-
-        # Try to get location
-        location_el = soup.find(
-            "div", attrs={"data-testid": "job-location"}
-        ) or soup.find("span", class_="location")
-        if location_el:
-            job["location"] = location_el.get_text(strip=True)
-
-        # Get description
-        desc_el = (
-            soup.find("section", attrs={"data-testid": "job-description"})
-            or soup.find("div", attrs={"data-testid": "job-description"})
-            or soup.find("main")
-        )
-        if desc_el:
-            job["description"] = " ".join(
-                desc_el.get_text(separator=" ", strip=True).split()[:500]
-            )
-
-        # Extract company from URL if not set
-        if job.get("company") == "Unknown":
-            match = re.search(r"jobs\.ashbyhq\.com/([^/]+)", url)
-            if match:
-                job["company"] = match.group(1)
-
-    # Generic fallback for other ATS platforms
+        enriched = _parse_ashby_job_page(soup, url)
     else:
-        title_el = soup.find("h1") or soup.find("title")
-        if title_el:
-            job["title"] = title_el.get_text(strip=True)
+        # Generic parser for all other ATS platforms
+        enriched = _parse_generic_job_page(soup)
 
-        # Try to find description in common containers
-        desc_el = (
-            soup.find("main")
-            or soup.find("article")
-            or soup.find("div", class_="description")
-        )
-        if desc_el:
-            job["description"] = " ".join(
-                desc_el.get_text(separator=" ", strip=True).split()[:500]
-            )
+    # Merge enriched data into job dict (only update non-empty fields)
+    for key, value in enriched.items():
+        if value:
+            job[key] = value
 
     return job
 
 
+# ============================================================================
+# Filtering Layer
+# ============================================================================
+
+
+def passes_keyword_filter(title: str, description: str) -> bool:
+    """Return True if job matches keyword filter."""
+    combined = f"{title} {description}".lower()
+    return any(keyword in combined for keyword in KEYWORDS)
+
+
+def passes_location_filter(location: str, description: str) -> bool:
+    """Return True if job matches location filter."""
+    text = f"{location} {description}".lower()
+    return any(hint in text for hint in EUROPE_REMOTE_HINTS)
+
+
+# ============================================================================
+# Normalization Layer
+# ============================================================================
+
+
 def normalize_jobs(raw_jobs: List[Dict[str, str]]) -> pd.DataFrame:
-    """Normalize raw job dicts into a DataFrame with required schema."""
+    """Convert raw job dicts to normalized DataFrame with job_id and scraped_at."""
     now_iso = datetime.now(UTC).isoformat()
 
-    normalized: List[Dict[str, str]] = []
+    normalized = []
     for job in raw_jobs:
         job_id = generate_job_id(
             title=job.get("title", ""),
@@ -740,56 +559,17 @@ def normalize_jobs(raw_jobs: List[Dict[str, str]]) -> pd.DataFrame:
     return pd.DataFrame(normalized)
 
 
-def compute_delta(master_df: pd.DataFrame, current_df: pd.DataFrame) -> pd.DataFrame:
-    """Compute new jobs by job_id compared to master."""
-    if master_df.empty:
-        return current_df.copy()
-
-    master_ids = set(master_df["job_id"].astype(str))
-    mask = ~current_df["job_id"].astype(str).isin(master_ids)
-    return current_df[mask].copy()
+# ============================================================================
+# Main Pipeline
+# ============================================================================
 
 
-def main() -> None:
-    """Main entry point for CLI execution."""
-    parser = argparse.ArgumentParser(
-        description="Weekly ATS Job Scraper using search API discovery."
-    )
-    parser.add_argument(
-        "query",
-        type=str,
-        help=(
-            "Free-form search query description "
-            '(e.g. "AI engineer roles in Europe / remote"). '
-            "Used for logging and to document the intent of this run."
-        ),
-    )
-    args = parser.parse_args()
-
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    logger.info("Starting ATS job scrape...")
-    logger.info("Search query (for documentation/intention): %s", args.query)
-
-    # Check for API keys
-    serpapi_key = os.getenv("SERPAPI_KEY")
-    bing_api_key = os.getenv("BING_SEARCH_API_KEY")
-    if not serpapi_key and not bing_api_key:
-        logger.error(
-            "No search API key found. Set SERPAPI_KEY or BING_SEARCH_API_KEY environment variable."
-        )
-        logger.error(
-            "Get SerpAPI key: https://serpapi.com/ (recommended) or Bing API key: https://www.microsoft.com/en-us/bing/apis/bing-web-search-api"
-        )
-        return
-
-    # Extract keywords and location hints from query
-    # Default to AI/engineering keywords and Europe/remote locations
+def _extract_query_parameters(query: str) -> tuple[List[str], List[str]]:
+    """Extract keywords and location hints from user query."""
     query_keywords = KEYWORDS.copy()
     location_keywords = EUROPE_REMOTE_HINTS.copy()
 
-    # Try to extract from user query (simple heuristic)
-    query_lower = args.query.lower()
+    query_lower = query.lower()
     if (
         "ai" in query_lower
         or "artificial intelligence" in query_lower
@@ -813,74 +593,114 @@ def main() -> None:
     ):
         location_keywords = ["Europe", "EU", "UK", "remote"] + EUROPE_REMOTE_HINTS
 
-    # Search for jobs via API
-    logger.info("Discovering jobs via search API (SerpAPI or Bing API)...")
-    search_jobs = search_jobs_via_api(
+    return query_keywords, location_keywords
+
+
+def main() -> None:
+    """Main entry point: Search API → Enrich → Filter → Normalize → Delta → CSV."""
+    parser = argparse.ArgumentParser(
+        description="Weekly ATS Job Scraper using search API discovery."
+    )
+    parser.add_argument(
+        "query",
+        type=str,
+        help='Free-form search query (e.g. "AI engineer roles in Europe / remote").',
+    )
+    args = parser.parse_args()
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Starting ATS job scrape...")
+    logger.info("Search query: %s", args.query)
+
+    # Check API keys
+    serpapi_key = os.getenv("SERPAPI_KEY")
+    bing_api_key = os.getenv("BING_SEARCH_API_KEY")
+    if not serpapi_key and not bing_api_key:
+        logger.error(
+            "No search API key found. Set SERPAPI_KEY or BING_SEARCH_API_KEY environment variable."
+        )
+        logger.error(
+            "Get SerpAPI key: https://serpapi.com/ (recommended) or Bing API key: https://www.microsoft.com/en-us/bing/apis/bing-web-search-api"
+        )
+        return
+
+    # Extract query parameters
+    query_keywords, location_keywords = _extract_query_parameters(args.query)
+
+    # Step 1: Discover job URLs via search API
+    logger.info("Discovering jobs via search API...")
+    discovered_jobs = discover_job_urls_via_search_api(
         query_keywords=query_keywords,
         location_keywords=location_keywords,
         max_results=200,
     )
 
-    logger.info("Found %d job URLs from search API", len(search_jobs))
-
-    # Filter URLs to ATS domains only
-    ats_jobs = []
-    for job in search_jobs:
-        url = job.get("url", "")
-        if any(domain in url for domain in ATS_DOMAINS):
-            ats_jobs.append(job)
-
-    logger.info("Found %d ATS URLs after filtering", len(ats_jobs))
-
-    if len(ats_jobs) == 0:
-        logger.warning("Zero jobs found. Check API keys, quotas, and search queries.")
+    if len(discovered_jobs) == 0:
+        logger.warning("Zero jobs discovered. Exiting.")
         return
 
-    # Enrich jobs with full details by scraping each URL
+    # Step 2: Filter to ATS domains only
+    ats_jobs = [
+        job
+        for job in discovered_jobs
+        if any(domain in job.get("url", "") for domain in ATS_DOMAINS)
+    ]
+    logger.info("Found %d ATS URLs after domain filtering", len(ats_jobs))
+
+    if len(ats_jobs) == 0:
+        logger.warning("Zero ATS URLs found. Exiting.")
+        return
+
+    # Step 3: Enrich jobs by scraping individual URLs
     logger.info("Enriching %d job URLs with full details...", len(ats_jobs))
     enriched_jobs = []
     for job in tqdm(ats_jobs, desc="Enriching jobs"):
         try:
             enriched = enrich_job_from_url(job)
-            # Apply filters
-            if passes_keyword_filter(
-                enriched.get("title", ""), enriched.get("description", "")
-            ):
-                if passes_location_filter(
-                    enriched.get("location", ""), enriched.get("description", "")
-                ):
-                    enriched_jobs.append(enriched)
+            enriched_jobs.append(enriched)
         except Exception:
             logger.debug("Failed to enrich job: %s", job.get("url", ""))
             continue
 
+    # Step 4: Filter by keywords and location
+    filtered_jobs = []
+    for job in enriched_jobs:
+        if passes_keyword_filter(job.get("title", ""), job.get("description", "")):
+            if passes_location_filter(
+                job.get("location", ""), job.get("description", "")
+            ):
+                filtered_jobs.append(job)
+
     logger.info(
-        "Found %d matching jobs after enrichment and filtering", len(enriched_jobs)
+        "Found %d matching jobs after keyword and location filtering",
+        len(filtered_jobs),
     )
-    all_raw_jobs = enriched_jobs
-    all_jobs_df = normalize_jobs(all_raw_jobs)
 
+    if len(filtered_jobs) == 0:
+        logger.warning("Zero jobs passed keyword/location filters. Exiting.")
+        return
+
+    # Step 5: Normalize and compute delta
+    normalized_df = normalize_jobs(filtered_jobs)
     master_df = load_master_csv()
-    delta_df = compute_delta(master_df, all_jobs_df)
+    delta_df = compute_delta(master_df, normalized_df)
 
-    # Append new jobs to master and save both CSVs
+    # Step 6: Save CSVs
     if not delta_df.empty:
         updated_master = pd.concat([master_df, delta_df], ignore_index=True)
     else:
         updated_master = master_df
 
-    total_scraped = len(all_jobs_df)
-    new_jobs_count = len(delta_df)
-
-    logger.info("Total jobs scraped this run (after filters): %d", total_scraped)
-    logger.info("New jobs found vs master: %d", new_jobs_count)
-
     save_csv(updated_master, MASTER_CSV_PATH)
     save_csv(delta_df, DELTA_CSV_PATH)
 
+    logger.info("Total jobs scraped this run: %d", len(normalized_df))
+    logger.info("New jobs found: %d", len(delta_df))
+
     print("CSV files updated successfully.")
-    print(f"Total jobs scraped this run: {total_scraped}")
-    print(f"New jobs found: {new_jobs_count}")
+    print(f"Total jobs scraped this run: {len(normalized_df)}")
+    print(f"New jobs found: {len(delta_df)}")
     print(f"Master CSV path: {MASTER_CSV_PATH}")
     print(f"Delta CSV path: {DELTA_CSV_PATH}")
 
